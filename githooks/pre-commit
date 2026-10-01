@@ -1,0 +1,66 @@
+#!/bin/sh
+# pre-commit hook for the solo-project-control skill.
+#
+# Why this exists
+#   The Reasonix PreToolUse hook (scripts/gate-hook.ps1) can only see the TEXT of
+#   the command about to run, so it decides "is this a commit?" by regex. That is
+#   bypassable on purpose or by accident:
+#       GIT=git; $GIT commit -m x     -> passes
+#       bash -c "git commit -m x"     -> passes
+#   A git hook is invoked by git ITSELF, so it runs no matter how the commit was
+#   spelled -- agent, terminal, GUI, script. This is the un-bypassable layer.
+#
+# Install (once, global):
+#   git config --global core.hooksPath "<skill>/githooks"
+#   -> <skill> is this file's parent's parent, e.g.
+#      C:/Users/<you>/AppData/Roaming/reasonix/skills/solo-project-control
+#
+# Escape hatch: `git commit --no-verify` skips every hook, including this one.
+#   That is deliberate -- it is the way out if the gate itself is broken.
+#
+# Scope
+#   Only projects that carry the process skeleton are gated. A repo without
+#   docs/PLAN.md is not one of ours, so we exit 0 and stay out of its way.
+#   (core.hooksPath is global, so EVERY repo on this machine runs this file.)
+#
+# Deliberately ASCII-only: this script prints nothing of its own except plain
+# ASCII; the human-facing Chinese comes from gate.ps1, which carries a BOM.
+
+# git runs hooks from the top level, but do not rely on it.
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -n "$root" ] || exit 0
+
+# Not one of ours -> never block it.
+[ -f "$root/docs/PLAN.md" ] || exit 0
+
+# Locate gate.ps1 relative to THIS file: <skill>/githooks/pre-commit
+#                                        -> <skill>/scripts/gate.ps1
+self_dir=$(cd "$(dirname "$0")" && pwd) || exit 0
+gate="$self_dir/../scripts/gate.ps1"
+[ -f "$gate" ] || exit 0          # skill not installed here -> nothing to enforce
+
+# Run the same gate the skill tells a human to run, from the project root.
+#
+# Extra args can be passed through with SPC_GATE_ARGS. The one that matters is
+# -AllowNoTicket, for the process-maintenance commit the skill explicitly allows
+# (a commit that belongs to no ticket):
+#     SPC_GATE_ARGS=-AllowNoTicket git commit -m "调整 改门禁"
+# Without this the git hook could not express the escape hatch at all, and a
+# maintenance commit would be blocked with no way through but --no-verify.
+# shellcheck disable=SC2086
+out=$(cd "$root" && powershell -NoProfile -File "$gate" $SPC_GATE_ARGS 2>&1)
+code=$?
+
+[ "$code" -eq 0 ] && exit 0
+
+echo "" >&2
+echo "BLOCKED by solo-project-control gate (git pre-commit hook)." >&2
+echo "Project root: $root" >&2
+echo "" >&2
+echo "The process gate reported violations, so this commit was not created." >&2
+echo "Fix the items below, then commit again." >&2
+echo "" >&2
+echo "$out" >&2
+echo "" >&2
+echo "If the gate itself is wrong, bypass once with: git commit --no-verify" >&2
+exit 1

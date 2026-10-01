@@ -17,13 +17,22 @@
       6. docs/CHANGELOG.md 是否与 git log 逐行一致（同时抓「刷漏了」和「手改了」）
       7. 判据里标注的测试文件是否存在（判据小节里写了「测试：<路径>」才查）
       8. 最新 commit 的 subject 是否以规定前缀开头（新增 / 修复 / 调整 / 验证 / 验收）
-      9. 最新 commit 的票是否已擦出台账（擦票与代码同进那次提交）
+      9. 台账里的票没被交付过（不变量）：STATUS.md 里的票号一旦出现在**任何** commit
+         的「追溯：」里，就该已擦出台账——还在就是漏擦票。查全部历史而非只看最新一条，
+         否则漏擦会被后面一条不带票号的提交挤出视野、从此没人查
      10. 一票一条 commit（同一票号最多出现在 1 条 commit；一条 commit 最多声明 1 个票号）
 
     第 3 项为什么算上「已交付的票」：票一擦，承诺有没有留档就再没人查了——
     而那恰恰是最需要保证的时刻。
 
     第 4 项默认 1（只串行、不开并行）：工作区只有一个，两票同时改就没法按票分开提交。
+
+    「首次 commit」自动放行：hook 在 commit 执行之前跑门禁，所以门禁看到的
+    「最新 commit」永远是上一条；仓库里一条 commit 都还没有时（git rev-list
+    -n 1 --all 无输出），第 2 / 5 / 6 / 8 / 10 项无从上查，自动放行并在输出里
+    写明理由。第 1 项（骨架齐全）不放行——骨架建好正是首次提交的前提。
+    新项目（git init 后）与半路接入、此前从未做过 git 的项目走同一条判定：
+    骨架建好后允许直接 commit 一次，把仓库立起来。
 
     退出码：0 = 全过；1 = 有违规（清单已打印）。
 
@@ -157,6 +166,39 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# --- 0b. 是不是「首次 commit」 ----------------------------------------------
+# hook 在 commit **执行之前**跑门禁，所以门禁眼里的「最新 commit」永远是上一条。
+# 首次提交时 git log 为空，第 5（票号）/ 8（前缀）/ 10（一票一条）项查的都是
+# 「上一条 commit」，此刻无从上查 —— 那是技术必然，不是违规。
+# 第 6 项（CHANGELOG 与 git log 逐行一致）也一并放行：起项目时骨架里的 CHANGELOG
+# 还是模板，要它当场等于 git log 就得「先提交 → 再刷 → 再 --amend」，与
+# 「一次 commit 把仓库立起来」相冲。首次提交只求仓库立起来，CHANGELOG 留待
+# 下次提交自然对齐。第 2 项同样跳过「比上一版多一行」的比对。
+# ★ 第 1 项（骨架齐全）**不放行** —— 骨架建好正是首次提交的前提。
+# 判定信号：git rev-list -n 1 --all 无输出 = 仓库里一条 commit 都没有。
+# 新项目（git init 后）与半路接入、此前从未做过 git 的项目，走的是同一条判定。
+$initialCommit = [string]::IsNullOrWhiteSpace((@(Invoke-Git 'rev-list' '-n' '1' '--all') -join ''))
+
+# 「最新 commit 是不是首次 commit」——人工在**提交之后**跑门禁时看这个。
+#
+# 光看「仓库只有 1 条 commit」不够：一个只提交过一次的普通仓库（比如测试基线）
+# 也是 1 条 commit，那样会被误当成首次 commit 放行，第 2 / 5 / 6 / 9 项当场失守。
+# 首次 commit 的定义性特征是**不挂票号**（见 SKILL.md：它跳过切票 / 判据 / 验收
+# 整条流程，无票可挂）——所以再收一道：最新 commit 必须没声明「追溯：T-号」。
+# 于是：
+#   · 挂票号的单 commit 仓库 → 不是首次 commit，一切照常查（第 9 项该报就报）；
+#   · 不挂票号的单 commit 仓库 → 首次 commit，第 2 / 5 / 6 / 9 项放行。
+# 普通的多 commit 仓库里，一条不挂票号的提交不会因此获得豁免——还要求只有 1 条 commit。
+$commitCount = 0
+$countRaw = @(Invoke-Git 'rev-list' '--count' 'HEAD')
+if ($countRaw.Count -gt 0) {
+    $parsed = 0
+    if ([int]::TryParse(([string]$countRaw[0]).Trim(), [ref]$parsed)) { $commitCount = $parsed }
+}
+$lastDeclaresTicket = ((@(Invoke-Git 'log' '-1' '--pretty=format:%B') -join "`n") -match '追溯[:：]\s*T-\d+')
+$isFirstCommit = ($commitCount -eq 1 -and -not $lastDeclaresTicket)
+$firstCommit = ($initialCommit -or $isFirstCommit)
+
 # --- 1. 骨架文件齐不齐 ------------------------------------------------------
 $required = @(
     'AGENTS.md',
@@ -180,7 +222,9 @@ if ($missing.Count -eq 0) {
 # 两个判定：(a) 表非空；(b) 本次 commit 若改了 PLAN，就必须在「变更记录」表里
 # 追一行——否则红线④「需求变动必回写 PLAN」只能靠自觉，机器什么都没守。
 $plan = Read-ProjectLines 'docs/PLAN.md'
-if ($null -eq $plan) {
+if ($firstCommit) {
+    Add-Check 'PLAN 变更记录已回写' $true @('首次 commit：起项目时 PLAN 与骨架一次落地，跳过「比上一版多一行」的比对 —— 自动放行')
+} elseif ($null -eq $plan) {
     Add-Check 'PLAN 变更记录已回写' $false @('读不到 docs/PLAN.md')
 } else {
     $rows = @(Get-ChangeRows $plan)
@@ -322,10 +366,22 @@ if ($null -eq $status) {
 $lastSubject = (@(Invoke-Git 'log' '-1' '--pretty=format:%s') -join "`n")
 $lastBody = (@(Invoke-Git 'log' '-1' '--pretty=format:%b') -join "`n")
 $lastAll = ($lastSubject + "`n" + $lastBody).Trim()
-if ([string]::IsNullOrWhiteSpace($lastAll)) {
+if ($firstCommit) {
+    Add-Check '最新 commit 带 追溯：T-票号' $true @('首次 commit：不挂票号 —— 自动放行（第 2 / 6 / 9 项同理）')
+} elseif ([string]::IsNullOrWhiteSpace($lastAll)) {
     Add-Check '最新 commit 带 追溯：T-票号' $false @('还没有任何 commit')
 } elseif ($lastAll -match '追溯[:：]\s*T-\d+') {
-    Add-Check '最新 commit 带 追溯：T-票号' $true @($lastSubject.Trim())
+    if ($commitCount -eq 1) {
+        # 仓库只有这一条 commit，却挂了票号 —— 多半是首次 commit 多写了一行。
+        # 带了票号就不再享受首次放行（那个票号会被算成「已交付」，第 3 项随后就查它）。
+        Add-Check '最新 commit 带 追溯：T-票号' $true @(
+            $lastSubject.Trim(),
+            '★ 这是仓库里唯一一条 commit，却带了票号 —— 首次 commit 不挂票号（它跳过切票 / 判据 / 验收，无票可挂）；',
+            '  挂了等于凭空造一张没闭环的票，第 3 项会要求它有判据小节。建议去掉这一行。'
+        )
+    } else {
+        Add-Check '最新 commit 带 追溯：T-票号' $true @($lastSubject.Trim())
+    }
 } elseif ($AllowNoTicket) {
     Add-Check '最新 commit 带 追溯：T-票号' $true @("已放行（-AllowNoTicket，视为流程维护类提交）：$($lastSubject.Trim())")
 } else {
@@ -343,7 +399,9 @@ $expected = @('# 变更记录', '', '> 由 git log 自动生成，勿手改。',
 foreach ($l in $logRaw) { $expected += [string]$l }
 
 $actualChan = Read-ProjectLines 'docs/CHANGELOG.md'
-if ($null -eq $actualChan) {
+if ($firstCommit) {
+    Add-Check 'CHANGELOG 与 git log 一致' $true @('首次 commit：此刻 git log 只有这一条，要求 CHANGELOG 当场一致就得「先提交 → 再刷 → 再 --amend」——自动放行，CHANGELOG 留待下次提交自然对齐')
+} elseif ($null -eq $actualChan) {
     Add-Check 'CHANGELOG 与 git log 一致' $false @('读不到 docs/CHANGELOG.md')
 } else {
     $a = Get-Signature $actualChan
@@ -440,7 +498,9 @@ if ($groups.Count -eq 0) {
 # 契约：subject = `<前缀> <业务描述>`，前缀 ∈ {新增, 修复, 调整, 验证, 验收}
 # （SKILL.md 提交纪律）。三个月后翻 git log 能不能看出业务，先看前缀在不在。
 $prefixes = @('新增', '修复', '调整', '验证', '验收')
-if ([string]::IsNullOrWhiteSpace($lastSubject)) {
+if ($initialCommit) {
+    Add-Check '最新 commit 前缀合规' $true @('首次 commit：仓库里还没有任何 commit，本条 commit 门禁看不到 —— 自动放行')
+} elseif ([string]::IsNullOrWhiteSpace($lastSubject)) {
     Add-Check '最新 commit 前缀合规' $false @('还没有任何 commit')
 } else {
     $hit = $null
@@ -457,24 +517,29 @@ if ([string]::IsNullOrWhiteSpace($lastSubject)) {
     }
 }
 
-# --- 9. 最新 commit 的票是否已擦出台账 --------------------------------------
+# --- 9. 台账里的票没被交付过（不变量）---------------------------------------
 # 一票一条 commit：擦票与代码 / 沉淀测试 / CHANGELOG 同进那一次提交。
-# 所以这条 commit 带的票号，提交后不该再留在 STATUS.md 里——还在就是漏擦票。
-$lastTickets = @()
-$lastNorm = Normalize-TicketText $lastAll
-if ($lastNorm -match '追溯[：:]') { $lastTickets = @(Get-TicketIds $lastNorm) }
-if ($tickets.Count -eq 0) {
-    Add-Check '最新 commit 的票已擦出台账' $true @('台账是空的（没有在飞票）')
-} elseif ($lastTickets.Count -eq 0) {
-    Add-Check '最新 commit 的票已擦出台账' $true @('最新 commit 没带票号（流程维护类提交），跳过')
+# 所以一张票**一旦出现在任何 commit 的「追溯：」里，它就该已擦出台账**。
+#
+# ★ 为什么查「任何历史 commit」而不是「最新那一条」：
+#   只看最新那条时，漏擦票会被后面任意一条不带票号的提交（流程维护类）挤出
+#   视野，从此再没人查——而「票擦它不擦」正是靠这一项守的。实测过：交付后
+#   立刻跑会报红，再提交一条维护提交就变绿了，票却还挂在台账里。
+#   改成不变量之后，漏擦在**每次**跑门禁时都报，直到真去复测并擦票。
+#   $shipped = 全部历史 commit 声明过的票号（第 3 项已算好，这里直接复用）。
+if ($firstCommit) {
+    Add-Check '台账里的票没被交付过' $true @('首次 commit：不挂票号，无所谓擦没擦')
+} elseif ($tickets.Count -eq 0) {
+    Add-Check '台账里的票没被交付过' $true @('台账是空的（没有在飞票）')
 } else {
-    $stillOpen = @($lastTickets | Where-Object { $tickets -contains $_ })
+    $stillOpen = @($tickets | Where-Object { $shipped -contains $_ })
     if ($stillOpen.Count -eq 0) {
-        Add-Check '最新 commit 的票已擦出台账' $true @("$($lastTickets -join ' / ') 都不在台账里")
+        Add-Check '台账里的票没被交付过' $true @("$($tickets.Count) 张在飞票：$ticketLabel —— 都没有交付记录")
     } else {
-        Add-Check '最新 commit 的票已擦出台账' $false @(
-            "$($stillOpen -join ' / ') 既在最新 commit 里、又还留在 docs/STATUS.md —— 漏擦票（票已交付，台账却还挂着它）",
-            '（一票一条：擦票要和代码 / 沉淀测试 / CHANGELOG 一起进那次 commit）'
+        Add-Check '台账里的票没被交付过' $false @(
+            "$($stillOpen -join ' / ') 既在台账里、又已被某条 commit 声明过 —— 漏擦票（票已交付，台账却还挂着它）",
+            '（一票一条：擦票要和代码 / 沉淀测试 / CHANGELOG 一起进那次提交）',
+            '★ 这条会一直报，直到你人工复测通过后擦票 —— 别为了刷绿自己擦：擦票的语义是「验过了」'
         )
     }
 }
@@ -516,7 +581,9 @@ foreach ($c in $commitTickets) {
     }
 }
 $repeatTicket = @($holderCount.Keys | Where-Object { $holderCount[$_] -gt 1 } | Sort-Object)
-if ($commitTickets.Count -eq 0) {
+if ($initialCommit) {
+    Add-Check '一票一条 commit' $true @('首次 commit：仓库里还没有任何 commit，本条 commit 门禁看不到 —— 自动放行')
+} elseif ($commitTickets.Count -eq 0) {
     Add-Check '一票一条 commit' $false @('还没有任何 commit')
 } elseif ($repeatTicket.Count -eq 0 -and $multiDeclare.Count -eq 0) {
     Add-Check '一票一条 commit' $true @("$($commitTickets.Count) 条 commit，$(@($holderCount.Keys).Count) 个票号各声明一次")
