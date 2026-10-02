@@ -98,7 +98,13 @@ if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root))
 Set-Location -LiteralPath $root
 
 # Run the process gate exactly the way AGENTS.md tells a human to run it.
-$out  = & powershell -NoProfile -File $gate 2>&1
+#
+# -PreCommit tells the gate we are BEFORE the commit: git log still shows the
+# previous HEAD, so "did this commit introduce the skeleton?" must be answered
+# from the STAGED diff, not from HEAD. Without it the gate would treat an
+# existing-history project's skeleton commit as a normal ticket commit (or worse,
+# wave through the ticket commit right after it).
+$out  = & powershell -NoProfile -File $gate -PreCommit 2>&1
 $code = $LASTEXITCODE
 
 if ($code -eq 0) { exit 0 }

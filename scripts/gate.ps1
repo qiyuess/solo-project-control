@@ -27,7 +27,7 @@
 
     第 4 项默认 1（只串行、不开并行）：工作区只有一个，两票同时改就没法按票分开提交。
 
-    「首次 commit」自动放行：hook 在 commit 执行之前跑门禁，所以门禁看到的
+    「起项目那次 commit」自动放行：hook 在 commit 执行之前跑门禁，所以门禁看到的
     「最新 commit」永远是上一条；仓库里一条 commit 都还没有时（git rev-list
     -n 1 --all 无输出），第 2 / 5 / 6 / 8 / 10 项无从上查，自动放行并在输出里
     写明理由。第 1 项（骨架齐全）不放行——骨架建好正是首次提交的前提。
@@ -57,6 +57,7 @@
 [CmdletBinding()]
 param(
     [switch]$AllowNoTicket,
+    [switch]$PreCommit,
     [int]$MaxInFlight = 1
 )
 
@@ -166,38 +167,76 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# --- 0b. 是不是「首次 commit」 ----------------------------------------------
-# hook 在 commit **执行之前**跑门禁，所以门禁眼里的「最新 commit」永远是上一条。
-# 首次提交时 git log 为空，第 5（票号）/ 8（前缀）/ 10（一票一条）项查的都是
-# 「上一条 commit」，此刻无从上查 —— 那是技术必然，不是违规。
-# 第 6 项（CHANGELOG 与 git log 逐行一致）也一并放行：起项目时骨架里的 CHANGELOG
-# 还是模板，要它当场等于 git log 就得「先提交 → 再刷 → 再 --amend」，与
-# 「一次 commit 把仓库立起来」相冲。首次提交只求仓库立起来，CHANGELOG 留待
-# 下次提交自然对齐。第 2 项同样跳过「比上一版多一行」的比对。
-# ★ 第 1 项（骨架齐全）**不放行** —— 骨架建好正是首次提交的前提。
-# 判定信号：git rev-list -n 1 --all 无输出 = 仓库里一条 commit 都没有。
-# 新项目（git init 后）与半路接入、此前从未做过 git 的项目，走的是同一条判定。
-$initialCommit = [string]::IsNullOrWhiteSpace((@(Invoke-Git 'rev-list' '-n' '1' '--all') -join ''))
-
-# 「最新 commit 是不是首次 commit」——人工在**提交之后**跑门禁时看这个。
+# --- 0b. 是不是「起项目那次 commit」（骨架首次进这个仓库）------------------
 #
-# 光看「仓库只有 1 条 commit」不够：一个只提交过一次的普通仓库（比如测试基线）
-# 也是 1 条 commit，那样会被误当成首次 commit 放行，第 2 / 5 / 6 / 9 项当场失守。
-# 首次 commit 的定义性特征是**不挂票号**（见 SKILL.md：它跳过切票 / 判据 / 验收
-# 整条流程，无票可挂）——所以再收一道：最新 commit 必须没声明「追溯：T-号」。
-# 于是：
-#   · 挂票号的单 commit 仓库 → 不是首次 commit，一切照常查（第 9 项该报就报）；
-#   · 不挂票号的单 commit 仓库 → 首次 commit，第 2 / 5 / 6 / 9 项放行。
-# 普通的多 commit 仓库里，一条不挂票号的提交不会因此获得豁免——还要求只有 1 条 commit。
-$commitCount = 0
-$countRaw = @(Invoke-Git 'rev-list' '--count' 'HEAD')
-if ($countRaw.Count -gt 0) {
-    $parsed = 0
-    if ([int]::TryParse(([string]$countRaw[0]).Trim(), [ref]$parsed)) { $commitCount = $parsed }
+# 起项目那一次**跳过切票 / 判据 / 验收整条流程**，所以它不该被后面那些检查卡住：
+# 此刻还没有票、CHANGELOG 还是模板、票号 / 前缀 / 一票一条 都无从谈起。
+# 第 1 项（骨架齐全）**不放行** —— 骨架建好正是那次提交的前提。
+#
+# 判定对象是「**骨架首次进这个仓库的那一次提交**」，而不是「仓库里第一条 commit」。
+# 三种起手都该被放行，且都走同一条判定：
+#   · 新项目：git init 后第一次提交；
+#   · 半路接入、此前从未做过 git 的项目：补建骨架后第一次提交；
+#   · **半路接入、但仓库早就有 git 历史**：把骨架补进去的那一次提交。← 本次新增
+#
+# 麻烦在于门禁被调用于两个时刻，而**同一个 HEAD 含义相反**：
+#   · commit 之前（hook 调用，带 -PreCommit）：HEAD 是**上一条**，还没提交；
+#   · commit 之后（人工跑）：HEAD 就是**刚提交的那条**。
+# 所以判据得分开看，否则接入老项目之后，**下一条正常的票提交也会被误放行**。
+#   · -PreCommit → 看**暂存区这次新增**了哪些骨架文件（`git diff --cached --name-only`），
+#                  骨架「此前不在版本库」而现在要进来 → 就是它；
+#   · 否则        → 看 **HEAD 这次**新增了哪些骨架文件（`git show --name-only`）。
+# 两种都要求：本次引入骨架，且骨架**此前不存在于版本库**（`git log` 里查不到）。
+# 用「此前版本库里没有」而不是「文件系统里没有」——工作区可能早就铺好了文件、
+# 只是还没进 git，那也算数。
+$skeletonFiles = @('AGENTS.md', 'docs/PLAN.md', 'docs/STATUS.md', 'docs/验收判据.md', 'docs/DECISIONS.md', 'docs/CHANGELOG.md')
+
+# HEAD 是否存在（空仓库没有 HEAD）
+$headExists = -not [string]::IsNullOrWhiteSpace((@(Invoke-Git 'rev-parse' '--verify' 'HEAD') -join ''))
+
+# 骨架在版本库历史里出现过吗（含 HEAD）
+$skeletonInHistory = $false
+if ($headExists) {
+    $histFiles = @(Invoke-Git 'log' '--pretty=format:' '--name-only' 'HEAD')
+    foreach ($f in $skeletonFiles) {
+        if (@($histFiles) -contains $f) { $skeletonInHistory = $true; break }
+    }
 }
-$lastDeclaresTicket = ((@(Invoke-Git 'log' '-1' '--pretty=format:%B') -join "`n") -match '追溯[:：]\s*T-\d+')
-$isFirstCommit = ($commitCount -eq 1 -and -not $lastDeclaresTicket)
-$firstCommit = ($initialCommit -or $isFirstCommit)
+
+# 本次要进 / 刚进的骨架文件
+$touchedFiles = @()
+if ($PreCommit) {
+    $touchedFiles = @(Invoke-Git 'diff' '--cached' '--name-only' '--diff-filter=A' 'HEAD')
+    if (-not $headExists) { $touchedFiles = @(Invoke-Git 'diff' '--cached' '--name-only' '--diff-filter=A') }
+} elseif ($headExists) {
+    $touchedFiles = @(Invoke-Git 'show' '--name-only' '--pretty=format:' '--diff-filter=A' 'HEAD')
+}
+$introducesSkeleton = $false
+foreach ($f in $skeletonFiles) {
+    if (@($touchedFiles) -contains $f) { $introducesSkeleton = $true; break }
+}
+
+$isProjectInit = ($introducesSkeleton -and -not $skeletonInHistory)
+
+# 「最新那条 commit（HEAD）本身就是引入骨架的那次」——人工在提交**之后**跑时用它。
+# 与 $isProjectInit 的区别只是时刻：那时骨架已进历史，所以不能再看 $skeletonInHistory。
+$headIntroducesSkeleton = $false
+if ((-not $PreCommit) -and $headExists) {
+    $headAdded = @(Invoke-Git 'show' '--name-only' '--pretty=format:' '--diff-filter=A' 'HEAD')
+    foreach ($f in $skeletonFiles) {
+        if (@($headAdded) -contains $f) { $headIntroducesSkeleton = $true; break }
+    }
+}
+
+# 合起来：**骨架首次进这个仓库的那一次提交**，无论门禁跑在它之前还是之后。
+#   · -PreCommit（提交前）→ $isProjectInit：暂存区引入骨架，且历史里还没有；
+#   · 人工（提交后）      → $headIntroducesSkeleton：HEAD 这次引入了骨架。
+# 后者只要求「HEAD 引入了骨架」，不再要求「历史里没有」——提交之后它必然在历史里了。
+$projectInit = ($isProjectInit -or $headIntroducesSkeleton)
+
+# 兼容旧变量名（下面若干检查点仍在用）：空仓库也算「起项目那次」。
+$initialCommit = (-not $headExists)
+$firstCommit = ($projectInit -or $initialCommit)
 
 # --- 1. 骨架文件齐不齐 ------------------------------------------------------
 $required = @(
@@ -223,7 +262,7 @@ if ($missing.Count -eq 0) {
 # 追一行——否则红线④「需求变动必回写 PLAN」只能靠自觉，机器什么都没守。
 $plan = Read-ProjectLines 'docs/PLAN.md'
 if ($firstCommit) {
-    Add-Check 'PLAN 变更记录已回写' $true @('首次 commit：起项目时 PLAN 与骨架一次落地，跳过「比上一版多一行」的比对 —— 自动放行')
+    Add-Check 'PLAN 变更记录已回写' $true @('起项目那次：PLAN 与骨架一次落地，跳过「比上一版多一行」的比对 —— 自动放行')
 } elseif ($null -eq $plan) {
     Add-Check 'PLAN 变更记录已回写' $false @('读不到 docs/PLAN.md')
 } else {
@@ -366,22 +405,22 @@ if ($null -eq $status) {
 $lastSubject = (@(Invoke-Git 'log' '-1' '--pretty=format:%s') -join "`n")
 $lastBody = (@(Invoke-Git 'log' '-1' '--pretty=format:%b') -join "`n")
 $lastAll = ($lastSubject + "`n" + $lastBody).Trim()
-if ($firstCommit) {
-    Add-Check '最新 commit 带 追溯：T-票号' $true @('首次 commit：不挂票号 —— 自动放行（第 2 / 6 / 9 项同理）')
+
+# ★ 顺序要紧：**先判「起项目那次误挂了票号」**，再判放行。
+# 反过来的话，起项目放行会把这个情况一并吞掉 —— 使用者永远看不到那句提醒，
+# 而挂了票号是要付出代价的（那个票号被算成「已交付」，第 3 项会拦）。
+if ($headIntroducesSkeleton -and $lastAll -match '追溯[:：]\s*T-\d+') {
+    Add-Check '最新 commit 带 追溯：T-票号' $true @(
+        $lastSubject.Trim(),
+        '★ 这次提交把骨架引进了仓库，却带了票号 —— 起项目那次不挂票号（它跳过切票 / 判据 / 验收，无票可挂）；',
+        '  挂了等于凭空造一张没闭环的票，第 3 项会要求它有判据小节。建议去掉这一行。'
+    )
+} elseif ($firstCommit) {
+    Add-Check '最新 commit 带 追溯：T-票号' $true @('起项目那次：不挂票号 —— 自动放行（第 2 / 6 / 9 项同理）')
 } elseif ([string]::IsNullOrWhiteSpace($lastAll)) {
     Add-Check '最新 commit 带 追溯：T-票号' $false @('还没有任何 commit')
 } elseif ($lastAll -match '追溯[:：]\s*T-\d+') {
-    if ($commitCount -eq 1) {
-        # 仓库只有这一条 commit，却挂了票号 —— 多半是首次 commit 多写了一行。
-        # 带了票号就不再享受首次放行（那个票号会被算成「已交付」，第 3 项随后就查它）。
-        Add-Check '最新 commit 带 追溯：T-票号' $true @(
-            $lastSubject.Trim(),
-            '★ 这是仓库里唯一一条 commit，却带了票号 —— 首次 commit 不挂票号（它跳过切票 / 判据 / 验收，无票可挂）；',
-            '  挂了等于凭空造一张没闭环的票，第 3 项会要求它有判据小节。建议去掉这一行。'
-        )
-    } else {
-        Add-Check '最新 commit 带 追溯：T-票号' $true @($lastSubject.Trim())
-    }
+    Add-Check '最新 commit 带 追溯：T-票号' $true @($lastSubject.Trim())
 } elseif ($AllowNoTicket) {
     Add-Check '最新 commit 带 追溯：T-票号' $true @("已放行（-AllowNoTicket，视为流程维护类提交）：$($lastSubject.Trim())")
 } else {
@@ -400,7 +439,7 @@ foreach ($l in $logRaw) { $expected += [string]$l }
 
 $actualChan = Read-ProjectLines 'docs/CHANGELOG.md'
 if ($firstCommit) {
-    Add-Check 'CHANGELOG 与 git log 一致' $true @('首次 commit：此刻 git log 只有这一条，要求 CHANGELOG 当场一致就得「先提交 → 再刷 → 再 --amend」——自动放行，CHANGELOG 留待下次提交自然对齐')
+    Add-Check 'CHANGELOG 与 git log 一致' $true @('起项目那次：此刻 git log 只有这一条，要求 CHANGELOG 当场一致就得「先提交 → 再刷 → 再 --amend」——自动放行，CHANGELOG 留待下次提交自然对齐')
 } elseif ($null -eq $actualChan) {
     Add-Check 'CHANGELOG 与 git log 一致' $false @('读不到 docs/CHANGELOG.md')
 } else {
@@ -498,8 +537,8 @@ if ($groups.Count -eq 0) {
 # 契约：subject = `<前缀> <业务描述>`，前缀 ∈ {新增, 修复, 调整, 验证, 验收}
 # （SKILL.md 提交纪律）。三个月后翻 git log 能不能看出业务，先看前缀在不在。
 $prefixes = @('新增', '修复', '调整', '验证', '验收')
-if ($initialCommit) {
-    Add-Check '最新 commit 前缀合规' $true @('首次 commit：仓库里还没有任何 commit，本条 commit 门禁看不到 —— 自动放行')
+if ($firstCommit) {
+    Add-Check '最新 commit 前缀合规' $true @('起项目那次：跳过中间流程，本条不查前缀 —— 自动放行')
 } elseif ([string]::IsNullOrWhiteSpace($lastSubject)) {
     Add-Check '最新 commit 前缀合规' $false @('还没有任何 commit')
 } else {
@@ -528,7 +567,7 @@ if ($initialCommit) {
 #   改成不变量之后，漏擦在**每次**跑门禁时都报，直到真去复测并擦票。
 #   $shipped = 全部历史 commit 声明过的票号（第 3 项已算好，这里直接复用）。
 if ($firstCommit) {
-    Add-Check '台账里的票没被交付过' $true @('首次 commit：不挂票号，无所谓擦没擦')
+    Add-Check '台账里的票没被交付过' $true @('起项目那次：不挂票号，无所谓擦没擦')
 } elseif ($tickets.Count -eq 0) {
     Add-Check '台账里的票没被交付过' $true @('台账是空的（没有在飞票）')
 } else {
@@ -581,8 +620,8 @@ foreach ($c in $commitTickets) {
     }
 }
 $repeatTicket = @($holderCount.Keys | Where-Object { $holderCount[$_] -gt 1 } | Sort-Object)
-if ($initialCommit) {
-    Add-Check '一票一条 commit' $true @('首次 commit：仓库里还没有任何 commit，本条 commit 门禁看不到 —— 自动放行')
+if ($firstCommit) {
+    Add-Check '一票一条 commit' $true @('起项目那次：跳过中间流程，本条不参与一票一条 —— 自动放行')
 } elseif ($commitTickets.Count -eq 0) {
     Add-Check '一票一条 commit' $false @('还没有任何 commit')
 } elseif ($repeatTicket.Count -eq 0 -and $multiDeclare.Count -eq 0) {

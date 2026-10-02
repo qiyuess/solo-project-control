@@ -47,8 +47,11 @@ gate="$self_dir/../scripts/gate.ps1"
 #     SPC_GATE_ARGS=-AllowNoTicket git commit -m "调整 改门禁"
 # Without this the git hook could not express the escape hatch at all, and a
 # maintenance commit would be blocked with no way through but --no-verify.
+# -PreCommit: this runs BEFORE the commit exists, so git log still shows the old
+# HEAD. The gate needs that to tell "this commit introduces the skeleton" from
+# HEAD's diff (post-commit) vs the STAGED diff (pre-commit).
 # shellcheck disable=SC2086
-out=$(cd "$root" && powershell -NoProfile -File "$gate" $SPC_GATE_ARGS 2>&1)
+out=$(cd "$root" && powershell -NoProfile -File "$gate" -PreCommit $SPC_GATE_ARGS 2>&1)
 code=$?
 
 [ "$code" -eq 0 ] && exit 0
